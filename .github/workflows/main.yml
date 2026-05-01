@@ -61,3 +61,84 @@ jobs:
           docker push $REGISTRY/$ECR_REPOSITORY:latest
           docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
+  DEPLOY:
+    needs: BUILD_AND_PUBLISH
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Get full EKS cluster name
+        id: cluster
+        run: |
+          NAME=$(aws eks list-clusters --region $AWS_REGION \
+                   --query "clusters[?starts_with(@, '$EKS_CLUSTER')] | [0]" \
+                   --output text)
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region $AWS_REGION --name ${{ steps.cluster.outputs.name }}
+
+      - name: Install NGINX Ingress Controller
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.10.1/deploy/static/provider/aws/deploy.yaml
+          kubectl wait --namespace ingress-nginx \
+            --for=condition=ready pod \
+            --selector=app.kubernetes.io/component=controller \
+            --timeout=300s
+
+      - name: Create ECR pull secret in Kubernetes
+        run: |
+          kubectl delete secret regcred --ignore-not-found
+          kubectl create secret docker-registry regcred \
+            --docker-server=${{ secrets.REGISTRY }} \
+            --docker-username=AWS \
+            --docker-password=$(aws ecr get-login-password --region $AWS_REGION)
+
+      - name: Deploy with Helm
+        uses: bitovi/github-actions-deploy-eks-helm@v1.2.10
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          cluster-name: ${{ steps.cluster.outputs.name }}
+          chart-path: helm/vprofilecharts
+          namespace: default
+          name: vprofile-stack
+          values: appimage=${{ secrets.REGISTRY }}/${{ env.ECR_REPOSITORY }},apptag=${{ github.run_number }}
+
+      - name: Diagnose deployment
+        if: always()
+        run: |
+          echo "=== Pods ==="
+          kubectl get pods -A
+          echo ""
+          echo "=== Ingress ==="
+          kubectl get ingress -A
+          echo ""
+          echo "=== Pod image (what is the pod actually trying to pull?) ==="
+          kubectl get pods -l app=vproapp -o jsonpath='{.items[*].spec.containers[*].image}'
+          echo ""
+
+      - name: Print app URL
+        if: success()
+        run: |
+          echo "Waiting for load balancer to become ready..."
+          for i in {1..30}; do
+            URL=$(kubectl get ingress vproapp-ingress -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+            if [ -n "$URL" ]; then
+              echo ""
+              echo "=================================================="
+              echo "Your app is at: http://$URL"
+              echo "=================================================="
+              exit 0
+            fi
+            echo "Not ready yet, retrying in 10s..."
+            sleep 10
+          done
+          echo "Load balancer not ready after 5 minutes. Check AWS console."
+
