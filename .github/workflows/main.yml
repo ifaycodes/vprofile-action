@@ -101,14 +101,15 @@ jobs:
             --docker-username=AWS \
             --docker-password=$(aws ecr get-login-password --region $AWS_REGION)
 
-
       - name: Deploy with Helm
-        run: |
-          helm upgrade --install vprofile-stack helm/vprofilecharts \
-            --namespace default \
-            --set appimage=${{ secrets.REGISTRY }}/${{ env.ECR_REPOSITORY }} \
-            --set apptag=${{ github.run_number }} \
-            --wait
+        uses: bitovi/github-actions-deploy-eks-helm@v1.2.10
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          cluster-name: ${{ steps.cluster.outputs.name }}
+          chart-path: helm/vprofilecharts
+          namespace: default
+          name: vprofile-stack
+          values: appimage=${{ secrets.REGISTRY }}/${{ env.ECR_REPOSITORY }},apptag=${{ github.run_number }}
 
       - name: Diagnose deployment
         if: always()
